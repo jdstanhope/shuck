@@ -1,0 +1,119 @@
+---
+title: "The tests were passing by luck"
+date: 2026-09-06
+summary: "huck's test suite was green on CI and broken on a Mac. Six fixes later, the interesting part wasn't any single bug — it was that the suite kept hiding how many there were, including from the command we used to count them."
+tags: ["testing", "portability", "tooling"]
+---
+
+huck's CI is green. It has been green for a long time. On a Mac, the same
+commit could not run its own lint step, had a test that took ninety seconds to
+fail, and could not finish the compatibility sweep at all.
+
+None of that was huck misbehaving. Every one of these was a *test* making an
+assumption about the machine it was running on — an assumption that happened to
+hold on the Linux box in CI.
+
+## A stopwatch that stopped everything
+
+The bash-compatibility harnesses wrap each command in `timeout`, so a hang can't
+wedge the run. macOS doesn't ship `timeout`, so the repo carries a small
+stand-in. It launched its watchdog like this:
+
+```bash
+( sleep "$duration" 2>/dev/null; kill -TERM "$cmd_pid" 2>/dev/null ) &
+```
+
+The watchdog's *errors* were silenced. Its *output* was not — so it inherited
+the pipe that the calling `$( … )` reads from. A command substitution doesn't
+finish when the command finishes; it finishes when everyone holding that pipe
+lets go. The `sleep` held on for the full duration, every single time:
+
+```bash
+# before
+$ start=$SECONDS; out=$(timeout 3 /bin/echo hi)
+$ echo "captured=[$out] elapsed=$((SECONDS-start))s"
+captured=[hi] elapsed=3s
+```
+
+Three seconds to echo a word. With a ten-second timeout and 328 harnesses
+running two shells apiece, the sweep was measured in hours.
+
+```bash
+# after
+captured=[hi] elapsed=0s
+```
+
+## A pause that caused the thing it was preventing
+
+A terminal test waited 600ms after Ctrl-C, so the shell could finish redrawing
+its prompt before the next keystroke arrived. It waited by sleeping.
+
+But a terminal has a finite buffer, and nobody was emptying it. So the shell
+filled it, blocked mid-redraw, and was no longer listening — which is exactly
+the state the pause existed to avoid. The keystrokes went nowhere and the test
+sat there until it gave up:
+
+```bash
+# before
+test result: FAILED. 26 passed; 1 failed; finished in 91.84s
+```
+
+Ninety of those ninety-two seconds were one test waiting for something that had
+already been dropped. Draining the terminal during the pause, instead of
+sleeping through it, fixes both the failure and the ninety seconds:
+
+```bash
+# after
+test result: ok. 27 passed; 0 failed; finished in 2.11s
+```
+
+I got this wrong first: I made *every* pause drain, and CI caught it within
+minutes. Draining throws away what it reads, and other tests in that file wait
+for output produced during exactly that window. Only two pauses needed it.
+
+## A default that was never reached
+
+One test built a shell and checked that, with no `TMPDIR` set, temporary files
+land in `/tmp`. macOS always sets `TMPDIR`. The default was never reached and
+the assertion never held.
+
+The strange part is that it *passed* about half the time. Another test in the
+same process removes `TMPDIR` from the environment, and the two were racing. So
+a test that is deterministically wrong when run alone was reporting a coin flip
+when run with its neighbours — hiding the bug rather than showing it.
+
+## The count itself was wrong
+
+Here is the one worth remembering. `cargo test` stops at the first test binary
+that fails. Every "how bad is it" measurement I took was therefore truncated at
+the first failure, and each fix revealed a failure I hadn't known about. The
+real number only appeared with `--no-fail-fast`:
+
+```bash
+# before
+175 binaries ok, 2 failed
+
+# after
+177 binaries ok, 0 failed
+```
+
+A suite that stops counting when it finds a problem will always tell you there
+is exactly one problem.
+
+## Where it stands
+
+On a Mac, huck's tests, lint and formatting checks all now pass, and the
+compatibility sweep runs in seconds rather than hours. The fixes were
+[#737](https://github.com/jdstanhope/huck/issues/737),
+[#740](https://github.com/jdstanhope/huck/issues/740),
+[#743](https://github.com/jdstanhope/huck/issues/743),
+[#745](https://github.com/jdstanhope/huck/issues/745),
+[#747](https://github.com/jdstanhope/huck/issues/747) and
+[#749](https://github.com/jdstanhope/huck/issues/749).
+
+Still open: the sweep compares huck against whichever bash is installed, and a
+Mac usually has a newer one than the 5.2.21 that huck targets — so it runs
+clean now, but disagrees about things that aren't huck's fault
+([#299](https://github.com/jdstanhope/huck/issues/299)). And one abort seen
+once and never reproduced, recorded in
+[#747](https://github.com/jdstanhope/huck/issues/747) rather than guessed at.
