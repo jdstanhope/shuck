@@ -1,6 +1,5 @@
-use std::io::Write;
+use std::io::{Read, Write};
 use std::process::{Command, Stdio};
-use std::time::Duration;
 
 fn huck_binary() -> String {
     env!("CARGO_BIN_EXE_huck").to_string()
@@ -155,20 +154,51 @@ fn trap_unknown_signal_errors_exit_1() {
 
 #[test]
 fn sigint_trap_fires_action() {
-    // Spawn huck with a script that installs a SIGINT trap and then
-    // sleeps. From the test, wait briefly for the trap to register +
-    // the sleep to start, then send SIGINT to the child. After the
-    // sleep returns (signal interrupts it), the trap action runs and
-    // huck continues to the `exit`.
-    let (mut child, pid) = spawn("trap 'echo caught' INT\nsleep 2\nexit\n");
+    // The script ANNOUNCES readiness and the test waits for it, rather than
+    // guessing with a fixed sleep (#749).
+    //
+    // ⚠️ The window this closes is real: everything between spawn and the
+    // signal — huck starting, reading the script, installing the trap, and
+    // entering `sleep` — has to have happened, or SIGINT lands on the DEFAULT
+    // disposition and kills huck outright, with `caught` never printed and an
+    // empty stdout. The old 200 ms guess held in the full workspace sweep but
+    // failed 4/4 on macOS when this binary was run on its own, which is the
+    // normal thing to do while working on traps.
+    //
+    // `echo READY` runs after the `trap` builtin and before `sleep`, so seeing
+    // it on stdout proves the trap is installed. Reading to EOF without it
+    // means huck died early — reported as such rather than as a missing
+    // `caught`, which is what made the old failure mode opaque.
+    let (mut child, pid) = spawn("trap 'echo caught' INT\necho READY\nsleep 2\nexit\n");
     // Drop stdin so huck reads to EOF and runs the script body.
     drop(child.stdin.take());
-    // Give huck ~200ms to parse the trap line + start sleeping.
-    std::thread::sleep(Duration::from_millis(200));
+
+    let mut out = child.stdout.take().expect("stdout is piped");
+    let mut seen = Vec::new();
+    let mut byte = [0u8; 1];
+    while !String::from_utf8_lossy(&seen).contains("READY") {
+        match out.read(&mut byte) {
+            // EOF before READY: huck exited instead of reaching `sleep`.
+            Ok(0) => panic!(
+                "huck exited before printing READY; stdout so far: {:?}",
+                String::from_utf8_lossy(&seen)
+            ),
+            Ok(_) => seen.extend_from_slice(&byte),
+            Err(e) => panic!("reading huck's stdout failed: {e}"),
+        }
+    }
+
     send_signal(pid, libc::SIGINT);
-    let out = child.wait_with_output().expect("wait");
-    let stdout = String::from_utf8_lossy(&out.stdout);
-    assert!(stdout.contains("caught"), "stdout: {stdout}");
+
+    // Bounded: the trap action runs and huck reaches `exit`, closing stdout.
+    let mut rest = String::new();
+    out.read_to_string(&mut rest)
+        .expect("read remaining stdout");
+    let _ = child.wait();
+    assert!(
+        rest.contains("caught"),
+        "the INT trap action did not run; stdout after READY: {rest:?}"
+    );
 }
 
 #[test]
